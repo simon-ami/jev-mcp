@@ -746,14 +746,15 @@ For Choice and Score, `confidence` measures how peaked the option probabilities 
 
 ### Providers
 
-Built-in provider selection runs through the shared [@jkudish/jev-agent-tools](https://github.com/jkudish/jev-agent-tools) wire package: it picks a carrier from your environment, sends the judgment, and validates the answer before any tool sees it. Four carriers are built in, tried in this order:
+Built-in provider selection runs through the shared [@jkudish/jev-agent-tools](https://github.com/jkudish/jev-agent-tools) wire package for the four TypeSafe-Jev carriers, with Google Gemini Decisions and Jev-compatible endpoints handled locally. Providers are auto-detected in this order:
 
 - **TypeSafe** (`TYPESAFE_API_KEY`): direct, and the default when set.
 - **OpenRouter** (`OPENROUTER_API_KEY`).
 - **Cloudflare Workers AI** (`CLOUDFLARE_API_TOKEN` or `JEV_CLOUDFLARE_API_TOKEN`, plus `CLOUDFLARE_ACCOUNT_ID`).
 - **Vercel AI Gateway** (`AI_GATEWAY_API_KEY`).
+- **Google Gemini Decisions** (`GEMINI_API_KEY` or `GOOGLE_API_KEY`): `gemini-decision-1` via `POST /v1beta/decisions`.
 
-`JEV_PROVIDER` forces one, or `compatible` for any System One-compatible endpoint. Unknown names and missing credentials are configuration errors, never silent fallbacks. For resilience reasons the OpenRouter, Cloudflare, and compatible transports are implemented locally; see [Transport resilience](#transport-resilience).
+`JEV_PROVIDER` forces one (`typesafe`, `openrouter`, `cloudflare`, `vercel`, `gemini`, or `compatible` for any System One-compatible endpoint). Unknown names and missing credentials are configuration errors, never silent fallbacks. For resilience reasons the OpenRouter, Cloudflare, Gemini, and compatible transports are implemented locally; see [Transport resilience](#transport-resilience).
 
 The built-ins stay limited to major providers. The no-code extension path here is the [compatible endpoint](#jev-compatible-endpoints); the [add-a-provider guide](https://github.com/jkudish/jev-agent-tools#adding-a-provider) in the shared package covers transport injection and third-party driver packages. Published driver packages get linked here on request.
 
@@ -763,19 +764,36 @@ The built-ins stay limited to major providers. The no-code extension path here i
 | `OPENROUTER_API_KEY` | none | OpenRouter `sk-or-` key; used when `TYPESAFE_API_KEY` is absent. |
 | `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` | none | Cloudflare Workers AI; used when no other provider key is present. `JEV_CLOUDFLARE_API_TOKEN` is honored first for separate credentials. |
 | `AI_GATEWAY_API_KEY` | none | Vercel AI Gateway; used when no other provider key is present. |
+| `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) | none | Google Gemini Decisions API (`gemini-decision-1`). Used automatically when none of the TypeSafe-Jev provider keys above are set, or forced with `JEV_PROVIDER=gemini`. |
 | `JEV_VERCEL_ZERO_DATA_RETENTION` | unset | `1` or `true` asks the Vercel AI Gateway to route only through its zero-data-retention providers; use with `JEV_PROVIDER=vercel`. See [Vercel](#vercel). |
-| `JEV_PROVIDER` | `auto` | Force `typesafe`, `openrouter`, `cloudflare`, `vercel`, or `compatible` instead of auto-detection. |
-| `JEV_MCP_MODEL` | `jev-latest` | Pin a Jev version, e.g. `jev-1.12`, or `typesafe/jev-1.13` on OpenRouter. |
+| `JEV_PROVIDER` | `auto` | Force `typesafe`, `openrouter`, `cloudflare`, `vercel`, `gemini`, or `compatible` instead of auto-detection. |
+| `JEV_MCP_MODEL` | `jev-latest` | Pin a model version, e.g. `jev-1.12`, `typesafe/jev-1.13` or `google/gemini-decision-1` on OpenRouter, or `gemini-decision-1` on Gemini (which is the default when `JEV_PROVIDER=gemini`). |
 | `TYPESAFE_BASE_URL` | none | Custom direct endpoint (origin only; the SDK appends its route). |
 | `JEV_API_BASE_URL` + `JEV_API_KEY` | none | Jev-compatible System One endpoint and Bearer token; use with `JEV_PROVIDER=compatible`. `JEV_API_BASE_URL` is the full POST URL including the `/v1/systemone` path. |
 | `JEV_MCP_REQUEST_TIMEOUT_MS` | `60000` | Whole-request deadline in milliseconds, covering every attempt, on the fetch-based transports. |
 | `JEV_MCP_MAX_ATTEMPTS` | `3` | Total attempts per request (clamped 1..6) on the fetch-based transports; retries happen only on 408, 409, 429, and 500 through 599. |
 | `JEV_OPENROUTER_BASE_URL` | `https://openrouter.ai/api` | Override the OpenRouter API root (the `/alpha/decisions` path is appended; a trailing slash is tolerated). |
 | `JEV_CLOUDFLARE_BASE_URL` | `https://api.cloudflare.com/client/v4` | Override the Cloudflare API root (`/accounts/<id>/ai/run` is appended; a trailing slash is tolerated). |
+| `JEV_GEMINI_BASE_URL` | `https://generativelanguage.googleapis.com` | Override the Gemini API root (the `/v1beta/decisions` path is appended; a trailing slash is tolerated). |
 
 ### Transport resilience
 
-The fetch-based transports (OpenRouter, Cloudflare, and the Jev-compatible endpoint) retry only on the standard not-processed status set (408, 409, 429, and 500 through 599), with jittered exponential backoff, at most `JEV_MCP_MAX_ATTEMPTS` total attempts, all inside one `JEV_MCP_REQUEST_TIMEOUT_MS` deadline. A status cannot prove the request was not processed, but that allowlist is the conservative retry trigger; ambiguous network-level failures (connection reset, TLS errors) are never retried, because without an idempotency key a re-send can double-process a paid call. Everything else fails immediately: caller cancellations, deadline expiry, non-retryable statuses, unparseable bodies, and responses over 1,000,000 bytes, a ceiling enforced while the body streams rather than after buffering. A cancelled MCP call aborts the in-flight HTTP request, cuts any backoff sleep short, and is never re-sent. Error bodies on those transports are redacted, so a reflecting endpoint can never echo a configured key into MCP-visible errors. The only exception is the fixed OpenRouter token-limit code `max_tokens_exceeded`; see [OpenRouter](#openrouter). Direct TypeSafe and Vercel calls use `@jkudish/jev-agent-tools`, whose direct fetch path avoids the SDK cancellation crash ([typesafe-sdk-js#2](https://github.com/typesafe-ai/typesafe-sdk-js/issues/2)); no retry or deadline uniformity is claimed for those two. Research and the original report: [issue #23](https://github.com/jkudish/jev-mcp/issues/23) by oppih.
+The fetch-based transports (OpenRouter, Cloudflare, Gemini, and the Jev-compatible endpoint) retry only on the standard not-processed status set (408, 409, 429, and 500 through 599), with jittered exponential backoff, at most `JEV_MCP_MAX_ATTEMPTS` total attempts, all inside one `JEV_MCP_REQUEST_TIMEOUT_MS` deadline. A status cannot prove the request was not processed, but that allowlist is the conservative retry trigger; ambiguous network-level failures (connection reset, TLS errors) are never retried, because without an idempotency key a re-send can double-process a paid call. Everything else fails immediately: caller cancellations, deadline expiry, non-retryable statuses, unparseable bodies, and responses over 1,000,000 bytes, a ceiling enforced while the body streams rather than after buffering. A cancelled MCP call aborts the in-flight HTTP request, cuts any backoff sleep short, and is never re-sent. Error bodies on those transports are redacted, so a reflecting endpoint can never echo a configured key into MCP-visible errors. The only exceptions are fixed allow-listed error codes (`max_tokens_exceeded` on OpenRouter; safety block codes on Gemini). Direct TypeSafe and Vercel calls use `@jkudish/jev-agent-tools`, whose direct fetch path avoids the SDK cancellation crash ([typesafe-sdk-js#2](https://github.com/typesafe-ai/typesafe-sdk-js/issues/2)); no retry or deadline uniformity is claimed for those two. Research and the original report: [issue #23](https://github.com/jkudish/jev-mcp/issues/23) by oppih.
+
+### Google Gemini Decisions
+
+With `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) set, judgments can run against Google's [Gemini Decisions API](https://ai.google.dev/api/decisions) (`POST /v1beta/decisions`) using `gemini-decision-1` (the default when `JEV_MCP_MODEL` is unset or `jev-latest`; set `JEV_MCP_MODEL` to pin another Gemini decision model). Set `JEV_PROVIDER=gemini` to force Gemini when other provider keys are also in the environment.
+
+Gemini Decision 1 speaks the same `noul`, `choice`, and `score` judgment primitives as Jev with zero output tokens (`output_tokens: 0`), and this transport adapts the wire differences automatically:
+
+- `state` is serialized as a JSON text `input`; structured `instructions` objects (such as `jev_classify`) are serialized as text.
+- `noul` criteria `{ true, false }` are translated to `{ true_description, false_description }`.
+- `choice` criteria with `null` descriptions are translated to `""`.
+- `usage.total_input_tokens` and `usage.total_output_tokens` are mapped to `{ input_tokens, output_tokens }`.
+- Choice and Score `confidence` values are recomputed from `probabilities` using TypeSafe's documented formulas (scaled from `0` for an even/split distribution to `1` for certainty) rather than Gemini's raw `p_max`, so tool thresholds (`auto_accept`, `review_at`) stay consistent across providers.
+- Input safety blocks (HTTP 400 with allow-listed codes or `prompt_feedback.block_reason`) fail explicitly without echoing upstream text.
+
+You can also route `google/gemini-decision-1` through OpenRouter by setting `JEV_PROVIDER=openrouter` and `JEV_MCP_MODEL=google/gemini-decision-1` (note that OpenRouter passes through the upstream `confidence` field as-is).
 
 ### Vercel
 

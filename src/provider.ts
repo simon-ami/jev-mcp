@@ -1,12 +1,13 @@
 // Jev transport: TypeSafe direct (default), OpenRouter Decisions, Cloudflare
-// Workers AI, or a caller-supplied Jev-compatible System One endpoint. All
-// speak the {state, questions} / answers contract; URL, auth, and model slugs
-// differ. Proxies add hops, so direct TypeSafe remains the recommended default.
+// Workers AI, Vercel AI Gateway, Google Gemini Decisions, or a caller-supplied
+// Jev-compatible System One endpoint. All speak the noul/choice/score judgment
+// contract; URL, auth, model slugs, and minor wire fields differ. Proxies add
+// hops, so direct TypeSafe remains the recommended default.
 
 import { ask, openrouterJevModel, resolveTransport, type JevTransport, type JevTransportReply } from "@jkudish/jev-agent-tools";
 import { isRecord } from "./lib.js";
 
-export type JevProvider = "typesafe" | "openrouter" | "cloudflare" | "vercel" | "compatible";
+export type JevProvider = "typesafe" | "openrouter" | "cloudflare" | "vercel" | "gemini" | "compatible";
 
 export interface AskResult {
   answers: Record<string, any>;
@@ -14,6 +15,8 @@ export interface AskResult {
   provider: JevProvider;
   model: string;
 }
+
+const DEFAULT_GEMINI_MODEL = "gemini-decision-1";
 
 const X_TITLE = "jev-mcp";
 const REFERER = "https://github.com/jkudish/jev-mcp";
@@ -27,9 +30,9 @@ function redactSecret(text: string, secret: string): string {
 
 // ── Transport resilience ─────────────────────────────────────────────────────
 // Research and the original report: GitHub issue #23 by oppih. Applies to the
-// fetch-based transports (openrouter, cloudflare, compatible); the typesafe
-// and vercel branches go through SDK-owned transports whose retry and timeout
-// semantics are theirs, so no uniformity is claimed for those.
+// fetch-based transports (openrouter, cloudflare, gemini, compatible); the
+// typesafe and vercel branches go through SDK-owned transports whose retry and
+// timeout semantics are theirs, so no uniformity is claimed for those.
 
 const positiveIntFromEnv = (name: string, fallback: number): number => {
   const raw = Number(process.env[name]);
@@ -46,6 +49,195 @@ const MAX_RETRY_DELAY_MS = 4_000;
 const MAX_RESPONSE_BYTES = 1_000_000;
 
 const SAFE_OPENROUTER_ERROR_TYPES = new Set(["max_tokens_exceeded"]);
+
+const SAFE_GEMINI_ERROR_CODES = new Set([
+  "safety",
+  "prohibited_content",
+  "blocklist",
+  "image_safety",
+  "content_blocked",
+]);
+
+const SAFE_GEMINI_BLOCK_REASONS = new Set([
+  "safety",
+  "other",
+  "blocklist",
+  "prohibited_content",
+  "image_safety",
+]);
+
+/**
+ * Gemini's Decisions API reports safety blocks either as an HTTP 400
+ * `{ error: { code, message } }` or as `prompt_feedback.block_reason` on 200.
+ * Expose only allow-listed constants; never return upstream text.
+ */
+function safeGeminiErrorCode(bodyText: string): string | undefined {
+  try {
+    const body = JSON.parse(bodyText);
+    const code = body?.error?.code;
+    return typeof code === "string" && SAFE_GEMINI_ERROR_CODES.has(code) ? code : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Map a Jev model name to Gemini Decisions API model IDs.
+ * The global default `jev-latest` maps to `gemini-decision-1`; any explicit
+ * model (e.g. `gemini-decision-1` or future versions) passes through verbatim.
+ */
+export function geminiModel(model: string): string {
+  return !model || model === "jev-latest" ? DEFAULT_GEMINI_MODEL : model;
+}
+
+/**
+ * Map a model name to OpenRouter's Decisions API model ID.
+ * Bare Jev versions and `jev-latest` delegate to `openrouterJevModel`, while
+ * explicit provider-prefixed slugs (e.g. `google/gemini-decision-1`) pass
+ * through verbatim instead of getting `typesafe/` prepended.
+ */
+export function openrouterModel(model: string): string {
+  if (model === "jev-latest" || model === "typesafe/jev-latest" || model === "~typesafe/jev-latest") {
+    return openrouterJevModel(model);
+  }
+  return model.includes("/") ? model : openrouterJevModel(model);
+}
+
+/**
+ * Serialize Jev's arbitrary JSON `state` to Gemini's `input` string.
+ * Per Google's Decisions API docs, structured JSON payloads should be
+ * serialized as text so payload keys stay data rather than content blocks,
+ * and `input` cannot be empty.
+ */
+export function toGeminiInput(state: unknown): string {
+  if (typeof state === "string") return state.length > 0 ? state : JSON.stringify(state);
+  return JSON.stringify(state) ?? "null";
+}
+
+/**
+ * TypeSafe Choice confidence: scales p_max linearly from 0 (even split 1/n)
+ * to 1 (certainty). Matches https://docs.typesafe.ai/confidence.md.
+ */
+export function choiceConfidence(probabilities: Record<string, unknown>): number | null {
+  const values = Object.values(probabilities);
+  const n = values.length;
+  if (n < 2) return null;
+  let pMax = -1;
+  for (const v of values) {
+    if (typeof v !== "number" || !Number.isFinite(v) || v < 0 || v > 1) return null;
+    if (v > pMax) pMax = v;
+  }
+  const raw = (pMax - 1 / n) / (1 - 1 / n);
+  return Math.min(1, Math.max(0, raw));
+}
+
+/**
+ * TypeSafe Score confidence: compares probability-weighted distance from the
+ * peak level against the uniform distribution's mean absolute deviation from
+ * the middle level. Matches https://docs.typesafe.ai/confidence.md.
+ */
+export function scoreConfidence(probabilities: Record<string, unknown>): number | null {
+  const n = Object.keys(probabilities).length;
+  if (n < 2) return null;
+  const probs: number[] = [];
+  let peakIndex = 0;
+  let peakProb = -1;
+  for (let i = 0; i < n; i++) {
+    if (!Object.hasOwn(probabilities, String(i))) return null;
+    const p = probabilities[String(i)];
+    if (typeof p !== "number" || !Number.isFinite(p) || p < 0 || p > 1) return null;
+    probs.push(p);
+    if (p > peakProb) {
+      peakProb = p;
+      peakIndex = i;
+    }
+  }
+  let spread = 0;
+  let evenSpread = 0;
+  const mid = (n - 1) / 2;
+  for (let i = 0; i < n; i++) {
+    spread += probs[i] * Math.abs(i - peakIndex);
+    evenSpread += Math.abs(i - mid);
+  }
+  evenSpread /= n;
+  if (evenSpread <= 0) return null;
+  return Math.min(1, Math.max(0, 1 - spread / evenSpread));
+}
+
+/**
+ * Recompute Choice and Score `confidence` on Gemini answers using TypeSafe's
+ * formulas (0 = uniform/split, 1 = certain) instead of Gemini's raw `p_max`,
+ * so tool default thresholds (`auto_accept`, `review_at`) behave consistently.
+ */
+export function adaptGeminiAnswers(answers: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [id, raw] of Object.entries(answers)) {
+    if (!isRecord(raw) || !isRecord(raw.probabilities)) {
+      out[id] = raw;
+      continue;
+    }
+    if (raw.type === "choice") {
+      const confidence = choiceConfidence(raw.probabilities);
+      out[id] = confidence !== null ? { ...raw, confidence } : raw;
+    } else if (raw.type === "score") {
+      const confidence = scoreConfidence(raw.probabilities);
+      out[id] = confidence !== null ? { ...raw, confidence } : raw;
+    } else {
+      out[id] = raw;
+    }
+  }
+  return out;
+}
+
+/**
+ * Translate Jev question objects to the Gemini Decisions API wire shape:
+ * - `instructions`: must be text (serialize structured object instructions such
+ *   as `jev_classify`'s `{ task, item }` to JSON).
+ * - `noul.criteria`: Jev uses `{ true, false }`; Gemini uses
+ *   `{ true_description, false_description }` (optional).
+ * - `choice.criteria`: Jev allows `null` for self-explanatory option IDs;
+ *   Gemini requires string descriptions (`""` when self-explanatory).
+ * - `score.criteria`: both use a 0-indexed string array.
+ */
+export function toGeminiQuestions(questions: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [id, raw] of Object.entries(questions)) {
+    if (!isRecord(raw)) {
+      out[id] = raw;
+      continue;
+    }
+    const instructions = typeof raw.instructions === "string" ? raw.instructions : JSON.stringify(raw.instructions ?? "");
+    const type = raw.type;
+    if (type === "noul") {
+      const q: Record<string, unknown> = { type: "noul", instructions };
+      if (isRecord(raw.criteria)) {
+        const criteria: Record<string, string> = {};
+        const trueDesc = raw.criteria.true_description ?? raw.criteria.true;
+        const falseDesc = raw.criteria.false_description ?? raw.criteria.false;
+        if (typeof trueDesc === "string") criteria.true_description = trueDesc;
+        if (typeof falseDesc === "string") criteria.false_description = falseDesc;
+        if (Object.keys(criteria).length > 0) q.criteria = criteria;
+      }
+      out[id] = q;
+    } else if (type === "choice") {
+      const criteria: Record<string, string> = {};
+      if (isRecord(raw.criteria)) {
+        for (const [key, desc] of Object.entries(raw.criteria)) {
+          criteria[key] = typeof desc === "string" ? desc : "";
+        }
+      }
+      out[id] = { type: "choice", instructions, criteria };
+    } else if (type === "score") {
+      const criteria = Array.isArray(raw.criteria)
+        ? raw.criteria.map((entry) => (typeof entry === "string" ? entry : String(entry ?? "")))
+        : raw.criteria;
+      out[id] = { type: "score", instructions, criteria };
+    } else {
+      out[id] = { ...raw, instructions };
+    }
+  }
+  return out;
+}
 
 /**
  * OpenRouter's Decisions envelope is { error: { code, message } }. For an
@@ -239,7 +431,17 @@ async function fetchWithResilience(url: string, init: RequestInit, deadline: Dea
 
 function resolve(env: NodeJS.ProcessEnv): JevProvider {
   const explicit = (env.JEV_PROVIDER ?? "auto").toLowerCase();
+  const hasGemini = Boolean(env.GEMINI_API_KEY || env.GOOGLE_API_KEY);
   const hasCompatible = Boolean(env.JEV_API_KEY && env.JEV_API_BASE_URL);
+  if (explicit === "gemini") {
+    if (!hasGemini) {
+      throw new Error(
+        "JEV_PROVIDER=gemini but GEMINI_API_KEY (or GOOGLE_API_KEY) is not set. " +
+          `JEV_MCP_MODEL is optional and defaults to ${DEFAULT_GEMINI_MODEL}.`,
+      );
+    }
+    return "gemini";
+  }
   if (explicit === "compatible") {
     const missing = ["JEV_API_KEY", "JEV_API_BASE_URL"].filter((name) => !env[name]);
     if (missing.length > 0) {
@@ -250,11 +452,18 @@ function resolve(env: NodeJS.ProcessEnv): JevProvider {
     }
     return "compatible";
   }
-  // The published package owns the four built-in credential rules and order.
-  if ((explicit === "auto" || explicit === "") && hasCompatible &&
-      !env.TYPESAFE_API_KEY && !/^sk-or-/.test(env.OPENROUTER_API_KEY ?? "") &&
-      !((env.JEV_CLOUDFLARE_API_TOKEN || env.CLOUDFLARE_API_TOKEN) && env.CLOUDFLARE_ACCOUNT_ID) &&
-      !env.AI_GATEWAY_API_KEY) return "compatible";
+  // The published package owns the four built-in TypeSafe-Jev credential rules
+  // and order. Gemini and compatible follow only when none of those four are set.
+  const hasBuiltin = Boolean(
+    env.TYPESAFE_API_KEY ||
+      /^sk-or-/.test(env.OPENROUTER_API_KEY ?? "") ||
+      ((env.JEV_CLOUDFLARE_API_TOKEN || env.CLOUDFLARE_API_TOKEN) && env.CLOUDFLARE_ACCOUNT_ID) ||
+      env.AI_GATEWAY_API_KEY,
+  );
+  if ((explicit === "auto" || explicit === "") && !hasBuiltin) {
+    if (hasGemini) return "gemini";
+    if (hasCompatible) return "compatible";
+  }
   return resolveTransport({ ...env, JEV_PROVIDER: explicit || "auto" }).name as JevProvider;
 }
 
@@ -313,9 +522,10 @@ export async function askJev(
   }
 
   if (provider === "openrouter") {
-    // The shared package owns Jev model names; this local path keeps MCP's
+    // The shared package owns Jev model names; provider-prefixed slugs (e.g.
+    // google/gemini-decision-1) pass through. This local path keeps MCP's
     // deadline, retry, body-size, and base-URL behavior.
-    const slug = openrouterJevModel(model);
+    const slug = openrouterModel(model);
     const deadline = deadlineSignal(signal, REQUEST_TIMEOUT_MS);
     try {
       const response = await fetchWithResilience(apiUrl(process.env.JEV_OPENROUTER_BASE_URL || "https://openrouter.ai/api", "/alpha/decisions"), {
@@ -351,6 +561,67 @@ export async function askJev(
         usage: { input_tokens: body.usage?.input_tokens ?? 0, output_tokens: body.usage?.output_tokens ?? 0 },
         provider,
         model: isRecord(body) && Object.hasOwn(body, "model") ? body.model as string : slug,
+      };
+    } finally {
+      deadline.dispose();
+    }
+  }
+
+  if (provider === "gemini") {
+    const slug = geminiModel(model);
+    const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || "";
+    const baseUrl = process.env.JEV_GEMINI_BASE_URL || "https://generativelanguage.googleapis.com";
+    const deadline = deadlineSignal(signal, REQUEST_TIMEOUT_MS);
+    try {
+      const response = await fetchWithResilience(
+        apiUrl(baseUrl, "/v1beta/decisions"),
+        {
+          method: "POST",
+          headers: {
+            "x-goog-api-key": apiKey,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model: slug,
+            input: toGeminiInput(state),
+            questions: toGeminiQuestions(questions),
+          }),
+        },
+        deadline,
+      );
+      const bodyText = await readBodyBounded(response, deadline);
+      if (!response.ok) {
+        const code = safeGeminiErrorCode(bodyText);
+        throw new Error(`Gemini decisions API ${response.status}${code ? ` (${code})` : ""}`);
+      }
+      let body: unknown;
+      try {
+        body = JSON.parse(bodyText);
+      } catch {
+        throw new Error(`Gemini decisions API ${response.status} returned an unparseable response`);
+      }
+      if (!isRecord(body)) {
+        throw new Error(`Gemini decisions API ${response.status} returned an invalid response`);
+      }
+      if (isRecord(body.prompt_feedback) && typeof body.prompt_feedback.block_reason === "string" && body.prompt_feedback.block_reason) {
+        const reason = SAFE_GEMINI_BLOCK_REASONS.has(body.prompt_feedback.block_reason)
+          ? body.prompt_feedback.block_reason
+          : undefined;
+        throw new Error(`Gemini decisions API blocked input${reason ? ` (${reason})` : ""}`);
+      }
+      const rawUsage = isRecord(body.usage) ? body.usage : null;
+      const tokenCount = (v: unknown): number =>
+        typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0;
+      const returnedModel =
+        typeof body.model === "string" && body.model.trim() ? body.model : slug;
+      return {
+        answers: isRecord(body.answers) ? adaptGeminiAnswers(body.answers) : {},
+        usage: {
+          input_tokens: tokenCount(rawUsage?.total_input_tokens ?? rawUsage?.input_tokens),
+          output_tokens: tokenCount(rawUsage?.total_output_tokens ?? rawUsage?.output_tokens),
+        },
+        provider,
+        model: returnedModel,
       };
     } finally {
       deadline.dispose();
