@@ -538,6 +538,7 @@ test("openrouter provider uses the latest alias and reports the effective model"
     [undefined, "~typesafe/jev-latest", "typesafe/jev-1.13-20260917", "typesafe/jev-1.13-20260917"],
     ["~typesafe/jev-latest", "~typesafe/jev-latest", undefined, "~typesafe/jev-latest"],
     ["typesafe/jev-1.13", "typesafe/jev-1.13", undefined, "typesafe/jev-1.13"],
+    ["google/gemini-decision-1", "google/gemini-decision-1", undefined, "google/gemini-decision-1"],
   ]) {
     await withMock(
       answers,
@@ -575,6 +576,246 @@ test("vercel zero data retention rejects an invalid setting before a request", a
       assert.equal(requests.length, 0);
     },
     { JEV_PROVIDER: "vercel", AI_GATEWAY_API_KEY: "test-gateway", JEV_VERCEL_ZERO_DATA_RETENTION: "yes" },
+  );
+});
+
+const geminiEnv = (port, overrides = {}) => ({
+  JEV_PROVIDER: "gemini",
+  GEMINI_API_KEY: "gemini-test-key",
+  JEV_GEMINI_BASE_URL: `http://127.0.0.1:${port}/`,
+  ...overrides,
+});
+
+test("gemini provider translates requests and maps usage for verify, classify, and review", async () => {
+  await withMock(
+    (request) => ({
+      relation_claim0: { type: "choice", ...pick("supports", Object.keys(request.questions.relation_claim0.criteria)) },
+      subject_claim0: { type: "noul", noul: 0.96, confidence: 0.96 },
+    }),
+    async (client, requests) => {
+      const result = await client.callTool({
+        name: "jev_verify",
+        arguments: { claims: ["The patch is ready"], evidence: "The tests pass" },
+      });
+      assert.notEqual(result.isError, true);
+      const body = payload(result);
+      assert.equal(body.provider, "gemini");
+      assert.equal(body.model, "gemini-decision-1");
+      assert.equal(body.results[0].verdict, "verified");
+      assert.deepEqual(body.usage, { input_tokens: 180, output_tokens: 0 });
+      assert.equal(requests.length, 1);
+      assert.equal(requests[0].method, "POST");
+      assert.equal(requests[0].path, "/v1beta/decisions");
+      assert.equal(requests[0].headers["x-goog-api-key"], "gemini-test-key");
+      assert.equal(requests[0].body.model, "gemini-decision-1");
+      assert.equal(typeof requests[0].body.input, "string");
+      assert.deepEqual(JSON.parse(requests[0].body.input).claims, [{ text: "The patch is ready", id: "claim0" }]);
+      assert.deepEqual(requests[0].body.questions.subject_claim0.criteria, {
+        true_description: "An evidence item reports on exactly what the claim asserts (the same check, run, file, object, or number)",
+        false_description: "The evidence is silent about it, or reports only on a different check, process, run, or object",
+      });
+    },
+    geminiEnv,
+    { usage: { total_input_tokens: 180, total_output_tokens: 0, total_tokens: 180 } },
+  );
+
+  // jev_classify sends object instructions and null choice criteria; Gemini
+  // requires string instructions and "" for self-explanatory option IDs.
+  await withMock(
+    (request) => ({
+      i0: { type: "choice", ...pick("c0", Object.keys(request.questions.i0.criteria)) },
+    }),
+    async (client, requests) => {
+      const result = await client.callTool({
+        name: "jev_classify",
+        arguments: {
+          items: [{ id: "ticket-1", text: "Refund my duplicate charge" }],
+          classes: [
+            { id: "billing", description: "Payments and refunds" },
+            { id: "support", description: "Technical issues" },
+          ],
+        },
+      });
+      assert.notEqual(result.isError, true);
+      const body = payload(result);
+      assert.equal(body.provider, "gemini");
+      assert.equal(body.model, "gemini-decision-2");
+      assert.equal(body.results[0].classification, "billing");
+      assert.equal(typeof requests[0].body.questions.i0.instructions, "string");
+      assert.deepEqual(requests[0].body.questions.i0.criteria, { c0: "", c1: "" });
+    },
+    (port) => geminiEnv(port, { JEV_MCP_MODEL: "gemini-decision-2" }),
+    { usage: { total_input_tokens: 95, total_output_tokens: 0 } },
+  );
+
+  // jev_review uses score questions (0-indexed string array criteria) + noul.
+  await withMock(
+    () => ({
+      correctness: { type: "score", score: 1.9, probabilities: { "0": 0.0, "1": 0.1, "2": 0.9 }, confidence: 0.9 },
+      spec_match: { type: "score", score: 2.0, probabilities: { "0": 0.0, "1": 0.0, "2": 1.0 }, confidence: 1.0 },
+      test_gap: { type: "score", score: 0.1, probabilities: { "0": 0.9, "1": 0.1, "2": 0.0 }, confidence: 0.9 },
+      blast_radius: { type: "score", score: 0.0, probabilities: { "0": 1.0, "1": 0.0, "2": 0.0 }, confidence: 1.0 },
+      safe_to_apply: { type: "noul", noul: 0.95, confidence: 0.95 },
+    }),
+    async (client, requests) => {
+      const result = await client.callTool({
+        name: "jev_review",
+        arguments: { request: "Fix off-by-one", diff: "- if (i < n)\n+ if (i <= n)", tests: "all passed" },
+      });
+      assert.notEqual(result.isError, true);
+      const body = payload(result);
+      assert.equal(body.provider, "gemini");
+      assert.equal(body.action, "auto");
+      // TypeSafe Score confidence for (0, 0.1, 0.9) is 0.85, not Gemini's raw p_max 0.9.
+      assert.ok(Math.abs(body.scores.correctness.confidence - 0.85) < 1e-12);
+      assert.equal(Array.isArray(requests[0].body.questions.correctness.criteria), true);
+      assert.equal(requests[0].body.questions.correctness.criteria.length, 3);
+    },
+    geminiEnv,
+    { usage: { total_input_tokens: 210, total_output_tokens: 0 } },
+  );
+
+  // A split Gemini score (0, 0.52, 0.48) reports raw p_max=0.52, which would
+  // clear review_at=0.5 if not normalized; TypeSafe Score confidence is 0.28,
+  // so jev_review escalates consistently with TypeSafe.
+  await withMock(
+    () => ({
+      correctness: { type: "score", score: 1.48, probabilities: { "0": 0.0, "1": 0.52, "2": 0.48 }, confidence: 0.52 },
+      spec_match: { type: "score", score: 2.0, probabilities: { "0": 0.0, "1": 0.0, "2": 1.0 }, confidence: 1.0 },
+      test_gap: { type: "score", score: 0.0, probabilities: { "0": 1.0, "1": 0.0, "2": 0.0 }, confidence: 1.0 },
+      blast_radius: { type: "score", score: 0.0, probabilities: { "0": 1.0, "1": 0.0, "2": 0.0 }, confidence: 1.0 },
+      safe_to_apply: { type: "noul", noul: 0.95, confidence: 0.95 },
+    }),
+    async (client) => {
+      const result = await client.callTool({
+        name: "jev_review",
+        arguments: { request: "Fix off-by-one", diff: "- if (i < n)\n+ if (i <= n)", tests: "all passed" },
+      });
+      assert.notEqual(result.isError, true);
+      const body = payload(result);
+      assert.equal(body.action, "escalate");
+      assert.ok(Math.abs(body.scores.correctness.confidence - 0.28) < 1e-12);
+      assert.ok(body.reason_codes.includes("confidence_below_review"));
+    },
+    geminiEnv,
+    { usage: { total_input_tokens: 210, total_output_tokens: 0 } },
+  );
+});
+
+test("gemini provider auto-selects with GEMINI_API_KEY or GOOGLE_API_KEY and errors when forced without a key", async () => {
+  await withMock(
+    (request) => ({ relation_claim0: { type: "choice", ...pick("supports", Object.keys(request.questions.relation_claim0.criteria)) } }),
+    async (client, requests) => {
+      const result = await client.callTool({
+        name: "jev_verify",
+        arguments: { claims: ["The patch is ready"], evidence: "The tests pass" },
+      });
+      const body = payload(result);
+      assert.equal(body.provider, "gemini");
+      assert.equal(requests[0].headers["x-goog-api-key"], "google-fallback-key");
+    },
+    (port) => ({
+      JEV_PROVIDER: "auto",
+      TYPESAFE_API_KEY: "",
+      TYPESAFE_BASE_URL: "",
+      GOOGLE_API_KEY: "google-fallback-key",
+      JEV_GEMINI_BASE_URL: `http://127.0.0.1:${port}`,
+    }),
+  );
+
+  await withMock(
+    {},
+    async (client, requests) => {
+      const result = await client.callTool({
+        name: "jev_verify",
+        arguments: { claims: ["The patch is ready"], evidence: "The tests pass" },
+      });
+      assert.equal(result.isError, true);
+      assert.match(result.content[0].text, /JEV_PROVIDER=gemini but GEMINI_API_KEY \(or GOOGLE_API_KEY\) is not set/);
+      assert.equal(requests.length, 0);
+    },
+    { JEV_PROVIDER: "gemini", TYPESAFE_API_KEY: "", GEMINI_API_KEY: "", GOOGLE_API_KEY: "" },
+  );
+});
+
+test("gemini provider handles safety blocks, redacts echoed keys, rejects unparseable bodies, and retries 503", async () => {
+  // HTTP 400 safety block exposes only allow-listed code, never upstream message or key.
+  await withMock(
+    {},
+    async (client) => {
+      const result = await client.callTool({
+        name: "jev_verify",
+        arguments: { claims: ["ready"], evidence: "tests pass" },
+      });
+      assert.equal(result.isError, true);
+      assert.equal(result.content[0].text, "Gemini decisions API 400 (safety)");
+      assert.ok(!result.content[0].text.includes("gemini-echo-secret"));
+    },
+    (port) => geminiEnv(port, { GEMINI_API_KEY: "gemini-echo-secret" }),
+    { status: 400, raw: JSON.stringify({ error: { code: "safety", message: "blocked gemini-echo-secret" } }) },
+  );
+
+  // Unknown error code stays hidden to prevent reflection.
+  await withMock(
+    {},
+    async (client) => {
+      const result = await client.callTool({
+        name: "jev_verify",
+        arguments: { claims: ["ready"], evidence: "tests pass" },
+      });
+      assert.equal(result.isError, true);
+      assert.equal(result.content[0].text, "Gemini decisions API 401");
+      assert.ok(!result.content[0].text.includes("gemini-echo-secret"));
+    },
+    (port) => geminiEnv(port, { GEMINI_API_KEY: "gemini-echo-secret" }),
+    { status: 401, raw: JSON.stringify({ error: { code: "gemini-echo-secret", message: "bad key gemini-echo-secret" } }) },
+  );
+
+  // 200 with prompt_feedback.block_reason surfaces as blocked error.
+  await withMock(
+    {},
+    async (client) => {
+      const result = await client.callTool({
+        name: "jev_verify",
+        arguments: { claims: ["ready"], evidence: "tests pass" },
+      });
+      assert.equal(result.isError, true);
+      assert.equal(result.content[0].text, "Gemini decisions API blocked input (prohibited_content)");
+    },
+    geminiEnv,
+    { raw: JSON.stringify({ answers: {}, prompt_feedback: { block_reason: "prohibited_content", block_reason_message: "secret details" } }) },
+  );
+
+  // Unparseable 200 body does not leak body text.
+  await withMock(
+    {},
+    async (client) => {
+      const result = await client.callTool({
+        name: "jev_verify",
+        arguments: { claims: ["ready"], evidence: "tests pass" },
+      });
+      assert.equal(result.isError, true);
+      assert.equal(result.content[0].text, "Gemini decisions API 200 returned an unparseable response");
+      assert.ok(!result.content[0].text.includes("gemini-echo-secret"));
+    },
+    (port) => geminiEnv(port, { GEMINI_API_KEY: "gemini-echo-secret" }),
+    { status: 200, raw: "garbage gemini-echo-secret {{{" },
+  );
+
+  // Retryable 503 retries once and succeeds.
+  await withMock(
+    (request) => ({ relation_claim0: { type: "choice", ...pick("supports", Object.keys(request.questions.relation_claim0.criteria)) } }),
+    async (client, requests) => {
+      const result = await client.callTool({
+        name: "jev_verify",
+        arguments: { claims: ["ready"], evidence: "tests pass" },
+      });
+      assert.notEqual(result.isError, true);
+      assert.equal(payload(result).results[0].verdict, "verified");
+      assert.equal(requests.length, 2);
+    },
+    geminiEnv,
+    { status: (count) => (count === 1 ? 503 : 200) },
   );
 });
 
